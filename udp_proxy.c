@@ -53,8 +53,9 @@
 struct event_base* base;               /* main base */
 struct sockaddr_in proxy, server;      /* proxy address and server address */
 int serverLen = sizeof(server);        /* server address len */
-int dropPacket  = 0;                   /* dropping packet interval */
-int delayPacket = 0;                   /* delay packet interval */
+int dropPacket    = 0;                 /* dropping packet interval */
+int delayPacket   = 0;                 /* delay packet interval */
+int dropSpecific  = 0;                 /* specific seq to drop in epoch 0 */
 
 typedef struct proxy_ctx {
     int  clientFd;       /* from client to proxy, downstream */
@@ -117,6 +118,20 @@ static char* GetRecordType(const char* msg)
 }
 
 
+static int GetRecordSeq(const char* msg)
+{
+    /* Only want to drop on Epoch 0. Only use the least
+     * significant 32-bits of the sequence number. */
+    if (msg[5] == 0 && msg[6] == 0)
+        return (int)( msg[9]  << 24 |
+                     msg[10] << 16 |
+                     msg[11] << 8 |
+                     msg[12]);
+
+    return 0;
+}
+
+
 /* msg callback, send along to peer or do manipulation */
 static void Msg(evutil_socket_t fd, short which, void* arg)
 {
@@ -152,6 +167,12 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
             printf("*** sending on delayed packet\n");
             send(currDelay->peerFd, currDelay->msg, currDelay->msgLen, 0);
             currDelay = NULL;
+        }
+
+        /* should we specifically drop the current packet */
+        if (dropSpecific && GetRecordSeq(msg) == dropSpecific) {
+            printf("*** but dropping this packet specifically\n");
+            return;
         }
 
         /* should we delay the current packet */
@@ -200,7 +221,7 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
         exit(EXIT_FAILURE);
     }
 
-    /* let's 'connect' to client so main loop doesn't here about this
+    /* let's 'connect' to client so main loop doesn't hear about this
        'connection' again, also allows pairing with upStream 'connect' */
     msgLen = recvfrom(fd, msg, MSG_SIZE, 0, (struct sockaddr*)&client, &len);
     printf("got %s from client, first msg\n", GetRecordType(msg));
@@ -272,6 +293,7 @@ static void Usage(void)
     printf("-p <num>            Proxy port to 'listen' on\n");
     printf("-s <server:port>    Server address in dotted decimal:port\n");
     printf("-d <num>            Drop every <num> packet, default 0\n");
+    printf("-x <num>            Drop specifically packet with sequence <num> from epoch 0\n");
     printf("-y <num>            Delay every <num> packet, default 0\n");
 }
 
@@ -283,7 +305,7 @@ int main(int argc, char** argv)
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = getopt(argc, argv, "?p:s:d:y:")) != -1) {
+    while ( (ch = getopt(argc, argv, "?p:s:d:y:x:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -300,6 +322,10 @@ int main(int argc, char** argv)
 
             case 'y' :
                 delayPacket = atoi(optarg);
+                break;
+
+            case 'x':
+                dropSpecific = atoi(optarg);
                 break;
 
             case 's' :
