@@ -122,11 +122,11 @@ static int GetRecordSeq(const char* msg)
 {
     /* Only want to drop on Epoch 0. Only use the least
      * significant 32-bits of the sequence number. */
-    if (msg[5] == 0 && msg[6] == 0)
-        return (int)( msg[9]  << 24 |
-                     msg[10] << 16 |
-                     msg[11] << 8 |
-                     msg[12]);
+    if (msg[3] == 0 && msg[4] == 0)
+        return (int)( msg[7]  << 24 |
+                     msg[8] << 16 |
+                     msg[9] << 8 |
+                     msg[10]);
 
     return 0;
 }
