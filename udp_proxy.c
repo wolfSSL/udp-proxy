@@ -58,6 +58,7 @@ int dropPacket    = 0;                 /* dropping packet interval */
 int delayPacket   = 0;                 /* delay packet interval */
 int dropSpecific  = 0;                 /* specific seq to drop in epoch 0 */
 int delayByOne    = 0;                 /* delay packet by 1 */
+int dupePackets   = 0;                 /* duplicate all packets */
 
 typedef struct proxy_ctx {
     int  clientFd;       /* from client to proxy, downstream */
@@ -222,6 +223,9 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         /* forward along */
         send(peerFd, msg, ret, 0);
 
+        if (dupePackets)
+            send(peerFd, msg, ret, 0);
+
         if (delayByOne &&
             GetRecordSeq(msg) > delayByOne &&
             side == serverSide &&
@@ -327,6 +331,7 @@ static void Usage(void)
     printf("-x <num>            Drop specifically packet with sequence <num> from epoch 0\n");
     printf("-y <num>            Delay every <num> packet, default 0\n");
     printf("-b <num>            Delay specific packet with sequence <num> by 1\n");
+    printf("-D                  Duplicate all packets\n");
 }
 
 
@@ -337,7 +342,7 @@ int main(int argc, char** argv)
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = getopt(argc, argv, "?p:s:d:y:x:b:")) != -1) {
+    while ( (ch = getopt(argc, argv, "?Dp:s:d:y:x:b:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -366,6 +371,10 @@ int main(int argc, char** argv)
 
             case 'b':
                 delayByOne = atoi(optarg);
+                break;
+
+            case 'D' :
+                dupePackets = 1;
                 break;
 
             default:
