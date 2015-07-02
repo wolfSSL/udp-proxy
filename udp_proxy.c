@@ -1,6 +1,6 @@
 /* udp_proxy.c
  *
- * Copyright (C) 2006-2013 wolfSSL Inc.
+ * Copyright (C) 2006-2015 wolfSSL Inc.
  *
  * This file is part of udp_proxy.
  *
@@ -19,12 +19,13 @@
  * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
  */
 
-/* udp_proxy.c 
- * gcc -Wall udp_proxy.c -o udp_proxy -levent 
- * ./udp_proxy -p 12345 -s 127.0.0.1:11111  
- * for use with CyaSSL example server with client talking to proxy on port 12345
- * ./examples/server/server -u
- * ./examples/client/client -u -p 12345
+/* udp_proxy.c
+ *   $ gcc -Wall udp_proxy.c -o udp_proxy -levent
+ *   $ ./udp_proxy -p 12345 -s 127.0.0.1:11111
+ * For use with wolfSSL example server with client talking to proxy
+ * on port 12345:
+ *   $ ./examples/server/server -u
+ *   $ ./examples/client/client -u -p 12345
 */
 
 #include <stdlib.h>
@@ -56,6 +57,7 @@ int serverLen = sizeof(server);        /* server address len */
 int dropPacket    = 0;                 /* dropping packet interval */
 int delayPacket   = 0;                 /* delay packet interval */
 int dropSpecific  = 0;                 /* specific seq to drop in epoch 0 */
+int delayByOne    = 0;                 /* delay packet by 1 */
 
 typedef struct proxy_ctx {
     int  clientFd;       /* from client to proxy, downstream */
@@ -162,6 +164,25 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
         msgCount++;
 
+        if (delayByOne &&
+            GetRecordSeq(msg) == delayByOne &&
+            side == serverSide) {
+
+            printf("*** delaying server packet %d\n", delayByOne);
+            if (currDelay == NULL)
+               currDelay = &tmpDelay;
+            else {
+               printf("*** oops, still have a packet in delay\n");
+               assert(0);
+            }
+            memcpy(currDelay->msg, msg, ret);
+            currDelay->msgLen = ret;
+            currDelay->sendCount = msgCount + delayPacket;
+            currDelay->peerFd = peerFd;
+            currDelay->ctx = ctx;
+            return;
+        }
+
         /* is it now time to send along delayed packet */
         if (delayPacket && currDelay && currDelay->sendCount == msgCount) {
             printf("*** sending on delayed packet\n");
@@ -200,6 +221,16 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
         /* forward along */
         send(peerFd, msg, ret, 0);
+
+        if (delayByOne &&
+            GetRecordSeq(msg) > delayByOne &&
+            side == serverSide &&
+            currDelay) {
+
+            printf("*** sending on delayed packet\n");
+            send(currDelay->peerFd, currDelay->msg, currDelay->msgLen, 0);
+            currDelay = NULL;
+        }
     }
 }
 
@@ -295,6 +326,7 @@ static void Usage(void)
     printf("-d <num>            Drop every <num> packet, default 0\n");
     printf("-x <num>            Drop specifically packet with sequence <num> from epoch 0\n");
     printf("-y <num>            Delay every <num> packet, default 0\n");
+    printf("-b <num>            Delay specific packet with sequence <num> by 1\n");
 }
 
 
@@ -305,7 +337,7 @@ int main(int argc, char** argv)
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = getopt(argc, argv, "?p:s:d:y:x:")) != -1) {
+    while ( (ch = getopt(argc, argv, "?p:s:d:y:x:b:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -330,6 +362,10 @@ int main(int argc, char** argv)
 
             case 's' :
                 serverString = optarg;
+                break;
+
+            case 'b':
+                delayByOne = atoi(optarg);
                 break;
 
             default:
