@@ -59,6 +59,7 @@ int delayPacket   = 0;                 /* delay packet interval */
 int dropSpecific  = 0;                 /* specific seq to drop in epoch 0 */
 int delayByOne    = 0;                 /* delay packet by 1 */
 int dupePackets   = 0;                 /* duplicate all packets */
+int retxPacket = 0;                    /* specific seq to retransmit */
 
 typedef struct proxy_ctx {
     int  clientFd;       /* from client to proxy, downstream */
@@ -132,6 +133,22 @@ static int GetRecordSeq(const char* msg)
                      msg[10]);
 
     return 0;
+}
+
+
+static void IncrementRecordSeq(char* msg)
+{
+    if (msg[3] == 0 && msg[4] == 0) {
+        unsigned long seq = (int)( msg[7] << 24 | msg[8] << 16 |
+                                   msg[9] << 8 | msg[10] );
+
+        seq++;
+
+        msg[7] = (char)(seq >> 24);
+        msg[8] = (char)(seq >> 16);
+        msg[9] = (char)(seq >> 8);
+        msg[10] = (char)seq;
+    }
 }
 
 
@@ -225,6 +242,14 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
         if (dupePackets)
             send(peerFd, msg, ret, 0);
+
+        if (retxPacket && GetRecordSeq(msg) == retxPacket
+            && side == serverSide) {
+
+            IncrementRecordSeq(msg);
+            send(peerFd, msg, ret, 0);
+        }
+
 
         if (delayByOne &&
             GetRecordSeq(msg) > delayByOne &&
@@ -332,6 +357,7 @@ static void Usage(void)
     printf("-y <num>            Delay every <num> packet, default 0\n");
     printf("-b <num>            Delay specific packet with sequence <num> by 1\n");
     printf("-D                  Duplicate all packets\n");
+    printf("-R <num>            Retransmit packet sequence <num>\n");
 }
 
 
@@ -342,7 +368,7 @@ int main(int argc, char** argv)
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = getopt(argc, argv, "?Dp:s:d:y:x:b:")) != -1) {
+    while ( (ch = getopt(argc, argv, "?Dp:s:d:y:x:b:R:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -375,6 +401,10 @@ int main(int argc, char** argv)
 
             case 'D' :
                 dupePackets = 1;
+                break;
+
+            case 'R' :
+                retxPacket = atoi(optarg);
                 break;
 
             default:
