@@ -60,6 +60,7 @@ int dropSpecific  = 0;                 /* specific seq to drop in epoch 0 */
 int delayByOne    = 0;                 /* delay packet by 1 */
 int dupePackets   = 0;                 /* duplicate all packets */
 int retxPacket = 0;                    /* specific seq to retransmit */
+int injectAlert = 0;                   /* inject an alert at end of epoch 0 */
 
 typedef struct proxy_ctx {
     int  clientFd;       /* from client to proxy, downstream */
@@ -81,6 +82,11 @@ delay_packet* currDelay = NULL;    /* current packet to delay */
 
 static char* serverSide = "server";
 static char* clientSide = "client";
+
+unsigned char bogusAlert[] =
+{
+    0x15, 254, 253, 0, 0, 0, 0, 0, 0, 0, 69, 0, 2, 1, 10
+};
 
 
 static char* GetRecordType(const char* msg)
@@ -138,11 +144,13 @@ static int GetRecordSeq(const char* msg)
 
 static void IncrementRecordSeq(char* msg)
 {
-    if (msg[3] == 0 && msg[4] == 0) {
+    if (msg[3] == 0 && (msg[4] == 0 || msg[4] == 1)) {
         unsigned long seq = (int)( msg[7] << 24 | msg[8] << 16 |
                                    msg[9] << 8 | msg[10] );
 
+        printf(" old seq: %lu\n", seq);
         seq++;
+        printf(" new seq: %lu\n", seq);
 
         msg[7] = (char)(seq >> 24);
         msg[8] = (char)(seq >> 16);
@@ -240,6 +248,23 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         /* forward along */
         send(peerFd, msg, ret, 0);
 
+        if (injectAlert) {
+            if (injectAlert == 1 && side == clientSide && msg[0] == 0x14) {
+                bogusAlert[10] = (unsigned char)(GetRecordSeq(msg) + 1);
+                injectAlert = 2;
+            }
+            if (injectAlert == 2 && side == serverSide && msg[0] == 0x14) {
+                printf("*** injecting a bogus alert from client after "
+                       "change cipher spec\n");
+                ret = send(ctx->serverFd, bogusAlert, sizeof(bogusAlert), 0);
+                if (ret < 0) {
+                    perror("send failed");
+                    exit(EXIT_FAILURE);
+                }
+                injectAlert = 0;
+            }
+        }
+
         if (dupePackets)
             send(peerFd, msg, ret, 0);
 
@@ -247,6 +272,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
             && side == serverSide) {
 
             IncrementRecordSeq(msg);
+            IncrementRecordSeq(msg+14);
             send(peerFd, msg, ret, 0);
         }
 
@@ -358,6 +384,7 @@ static void Usage(void)
     printf("-b <num>            Delay specific packet with sequence <num> by 1\n");
     printf("-D                  Duplicate all packets\n");
     printf("-R <num>            Retransmit packet sequence <num>\n");
+    printf("-a                  Inject clear alert from client after CCS\n");
 }
 
 
@@ -368,7 +395,7 @@ int main(int argc, char** argv)
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = getopt(argc, argv, "?Dp:s:d:y:x:b:R:")) != -1) {
+    while ( (ch = getopt(argc, argv, "?Dap:s:d:y:x:b:R:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -405,6 +432,10 @@ int main(int argc, char** argv)
 
             case 'R' :
                 retxPacket = atoi(optarg);
+                break;
+
+            case 'a':
+                injectAlert = 1;
                 break;
 
             default:
