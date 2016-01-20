@@ -130,15 +130,17 @@ static char* GetRecordType(const char* msg)
 
 static int GetRecordSeq(const char* msg)
 {
-    /* Only want to drop on Epoch 0. Only use the least
-     * significant 32-bits of the sequence number. */
-    if (msg[3] == 0 && msg[4] == 0)
-        return (int)( msg[7]  << 24 |
-                     msg[8] << 16 |
-                     msg[9] << 8 |
-                     msg[10]);
+    /* Only use the least significant 32-bits of the sequence number. */
+    return (int)( msg[7]  << 24 |
+                  msg[8] << 16 |
+                  msg[9] << 8 |
+                  msg[10]);
+}
 
-    return 0;
+
+static int GetRecordEpoch(const char* msg)
+{
+    return (int)(msg[3] << 8 | msg[4]);
 }
 
 
@@ -191,6 +193,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         msgCount++;
 
         if (delayByOne &&
+            GetRecordEpoch(msg) == 0 &&
             GetRecordSeq(msg) == delayByOne &&
             side == serverSide) {
 
@@ -216,8 +219,11 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
             currDelay = NULL;
         }
 
-        /* should we specifically drop the current packet */
-        if (dropSpecific && GetRecordSeq(msg) == dropSpecific) {
+        /* should we specifically drop the current packet from epoch 0 */
+        if (dropSpecific && side == serverSide &&
+            GetRecordEpoch(msg) == 0 &&
+            GetRecordSeq(msg) == dropSpecific) {
+
             printf("*** but dropping this packet specifically\n");
             return;
         }
@@ -268,8 +274,8 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         if (dupePackets)
             send(peerFd, msg, ret, 0);
 
-        if (retxPacket && GetRecordSeq(msg) == retxPacket
-            && side == serverSide) {
+        if (retxPacket && GetRecordEpoch(msg) == 0
+            && GetRecordSeq(msg) == retxPacket && side == serverSide) {
 
             IncrementRecordSeq(msg);
             IncrementRecordSeq(msg+14);
@@ -278,6 +284,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
 
         if (delayByOne &&
+            GetRecordEpoch(msg) == 0 &&
             GetRecordSeq(msg) > delayByOne &&
             side == serverSide &&
             currDelay) {
