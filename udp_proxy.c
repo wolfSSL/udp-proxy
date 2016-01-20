@@ -1,6 +1,6 @@
 /* udp_proxy.c
  *
- * Copyright (C) 2006-2013 wolfSSL Inc.
+ * Copyright (C) 2006-2015 wolfSSL Inc.
  *
  * This file is part of udp_proxy.
  *
@@ -19,12 +19,13 @@
  * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
  */
 
-/* udp_proxy.c 
- * gcc -Wall udp_proxy.c -o udp_proxy -levent 
- * ./udp_proxy -p 12345 -s 127.0.0.1:11111  
- * for use with CyaSSL example server with client talking to proxy on port 12345
- * ./examples/server/server -u
- * ./examples/client/client -u -p 12345
+/* udp_proxy.c
+ *   $ gcc -Wall udp_proxy.c -o udp_proxy -levent
+ *   $ ./udp_proxy -p 12345 -s 127.0.0.1:11111
+ * For use with wolfSSL example server with client talking to proxy
+ * on port 12345:
+ *   $ ./examples/server/server -u
+ *   $ ./examples/client/client -u -p 12345
 */
 
 #include <stdlib.h>
@@ -53,8 +54,14 @@
 struct event_base* base;               /* main base */
 struct sockaddr_in proxy, server;      /* proxy address and server address */
 int serverLen = sizeof(server);        /* server address len */
-int dropPacket  = 0;                   /* dropping packet interval */
-int delayPacket = 0;                   /* delay packet interval */
+int dropPacket    = 0;                 /* dropping packet interval */
+int delayPacket   = 0;                 /* delay packet interval */
+int dropSpecific  = 0;                 /* specific seq to drop in epoch 0 */
+int dropSpecificSeq  = 0;              /* specific seq to drop in epoch 0 */
+int delayByOne    = 0;                 /* delay packet by 1 */
+int dupePackets   = 0;                 /* duplicate all packets */
+int retxPacket = 0;                    /* specific seq to retransmit */
+int injectAlert = 0;                   /* inject an alert at end of epoch 0 */
 
 typedef struct proxy_ctx {
     int  clientFd;       /* from client to proxy, downstream */
@@ -76,6 +83,11 @@ delay_packet* currDelay = NULL;    /* current packet to delay */
 
 static char* serverSide = "server";
 static char* clientSide = "client";
+
+unsigned char bogusAlert[] =
+{
+    0x15, 254, 253, 0, 0, 0, 0, 0, 0, 0, 69, 0, 2, 1, 10
+};
 
 
 static char* GetRecordType(const char* msg)
@@ -117,6 +129,40 @@ static char* GetRecordType(const char* msg)
 }
 
 
+static int GetRecordSeq(const char* msg)
+{
+    /* Only use the least significant 32-bits of the sequence number. */
+    return (int)( msg[7]  << 24 |
+                  msg[8] << 16 |
+                  msg[9] << 8 |
+                  msg[10]);
+}
+
+
+static int GetRecordEpoch(const char* msg)
+{
+    return (int)(msg[3] << 8 | msg[4]);
+}
+
+
+static void IncrementRecordSeq(char* msg)
+{
+    if (msg[3] == 0 && (msg[4] == 0 || msg[4] == 1)) {
+        unsigned long seq = (int)( msg[7] << 24 | msg[8] << 16 |
+                                   msg[9] << 8 | msg[10] );
+
+        printf(" old seq: %lu\n", seq);
+        seq++;
+        printf(" new seq: %lu\n", seq);
+
+        msg[7] = (char)(seq >> 24);
+        msg[8] = (char)(seq >> 16);
+        msg[9] = (char)(seq >> 8);
+        msg[10] = (char)seq;
+    }
+}
+
+
 /* msg callback, send along to peer or do manipulation */
 static void Msg(evutil_socket_t fd, short which, void* arg)
 {
@@ -147,11 +193,40 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
         msgCount++;
 
+        if (delayByOne &&
+            GetRecordEpoch(msg) == 0 &&
+            GetRecordSeq(msg) == delayByOne &&
+            side == serverSide) {
+
+            printf("*** delaying server packet %d\n", delayByOne);
+            if (currDelay == NULL)
+               currDelay = &tmpDelay;
+            else {
+               printf("*** oops, still have a packet in delay\n");
+               assert(0);
+            }
+            memcpy(currDelay->msg, msg, ret);
+            currDelay->msgLen = ret;
+            currDelay->sendCount = msgCount + delayPacket;
+            currDelay->peerFd = peerFd;
+            currDelay->ctx = ctx;
+            return;
+        }
+
         /* is it now time to send along delayed packet */
         if (delayPacket && currDelay && currDelay->sendCount == msgCount) {
             printf("*** sending on delayed packet\n");
             send(currDelay->peerFd, currDelay->msg, currDelay->msgLen, 0);
             currDelay = NULL;
+        }
+
+        /* should we specifically drop the current packet from epoch 0 */
+        if (dropSpecific && side == serverSide &&
+            GetRecordEpoch(msg) == 0 &&
+            GetRecordSeq(msg) == dropSpecificSeq) {
+
+            printf("*** but dropping this packet specifically\n");
+            return;
         }
 
         /* should we delay the current packet */
@@ -179,6 +254,46 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
         /* forward along */
         send(peerFd, msg, ret, 0);
+
+        if (injectAlert) {
+            if (injectAlert == 1 && side == clientSide && msg[0] == 0x14) {
+                bogusAlert[10] = (unsigned char)(GetRecordSeq(msg) + 1);
+                injectAlert = 2;
+            }
+            if (injectAlert == 2 && side == serverSide && msg[0] == 0x14) {
+                printf("*** injecting a bogus alert from client after "
+                       "change cipher spec\n");
+                ret = send(ctx->serverFd, bogusAlert, sizeof(bogusAlert), 0);
+                if (ret < 0) {
+                    perror("send failed");
+                    exit(EXIT_FAILURE);
+                }
+                injectAlert = 0;
+            }
+        }
+
+        if (dupePackets)
+            send(peerFd, msg, ret, 0);
+
+        if (retxPacket && GetRecordEpoch(msg) == 0
+            && GetRecordSeq(msg) == retxPacket && side == serverSide) {
+
+            IncrementRecordSeq(msg);
+            IncrementRecordSeq(msg+14);
+            send(peerFd, msg, ret, 0);
+        }
+
+
+        if (delayByOne &&
+            GetRecordEpoch(msg) == 0 &&
+            GetRecordSeq(msg) > delayByOne &&
+            side == serverSide &&
+            currDelay) {
+
+            printf("*** sending on delayed packet\n");
+            send(currDelay->peerFd, currDelay->msg, currDelay->msgLen, 0);
+            currDelay = NULL;
+        }
     }
 }
 
@@ -200,7 +315,7 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
         exit(EXIT_FAILURE);
     }
 
-    /* let's 'connect' to client so main loop doesn't here about this
+    /* let's 'connect' to client so main loop doesn't hear about this
        'connection' again, also allows pairing with upStream 'connect' */
     msgLen = recvfrom(fd, msg, MSG_SIZE, 0, (struct sockaddr*)&client, &len);
     printf("got %s from client, first msg\n", GetRecordType(msg));
@@ -272,7 +387,12 @@ static void Usage(void)
     printf("-p <num>            Proxy port to 'listen' on\n");
     printf("-s <server:port>    Server address in dotted decimal:port\n");
     printf("-d <num>            Drop every <num> packet, default 0\n");
+    printf("-x <num>            Drop specifically packet with sequence <num> from epoch 0\n");
     printf("-y <num>            Delay every <num> packet, default 0\n");
+    printf("-b <num>            Delay specific packet with sequence <num> by 1\n");
+    printf("-D                  Duplicate all packets\n");
+    printf("-R <num>            Retransmit packet sequence <num>\n");
+    printf("-a                  Inject clear alert from client after CCS\n");
 }
 
 
@@ -283,7 +403,7 @@ int main(int argc, char** argv)
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = getopt(argc, argv, "?p:s:d:y:")) != -1) {
+    while ( (ch = getopt(argc, argv, "?Dap:s:d:y:x:b:R:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -302,8 +422,29 @@ int main(int argc, char** argv)
                 delayPacket = atoi(optarg);
                 break;
 
+            case 'x':
+                dropSpecific = 1;
+                dropSpecificSeq = atoi(optarg);
+                break;
+
             case 's' :
                 serverString = optarg;
+                break;
+
+            case 'b':
+                delayByOne = atoi(optarg);
+                break;
+
+            case 'D' :
+                dupePackets = 1;
+                break;
+
+            case 'R' :
+                retxPacket = atoi(optarg);
+                break;
+
+            case 'a':
+                injectAlert = 1;
                 break;
 
             default:
