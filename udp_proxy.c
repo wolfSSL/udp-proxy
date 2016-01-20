@@ -57,6 +57,7 @@ int serverLen = sizeof(server);        /* server address len */
 int dropPacket    = 0;                 /* dropping packet interval */
 int delayPacket   = 0;                 /* delay packet interval */
 int dropSpecific  = 0;                 /* specific seq to drop in epoch 0 */
+int dropSpecificSeq  = 0;              /* specific seq to drop in epoch 0 */
 int delayByOne    = 0;                 /* delay packet by 1 */
 int dupePackets   = 0;                 /* duplicate all packets */
 int retxPacket = 0;                    /* specific seq to retransmit */
@@ -222,7 +223,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         /* should we specifically drop the current packet from epoch 0 */
         if (dropSpecific && side == serverSide &&
             GetRecordEpoch(msg) == 0 &&
-            GetRecordSeq(msg) == dropSpecific) {
+            GetRecordSeq(msg) == dropSpecificSeq) {
 
             printf("*** but dropping this packet specifically\n");
             return;
@@ -422,7 +423,8 @@ int main(int argc, char** argv)
                 break;
 
             case 'x':
-                dropSpecific = atoi(optarg);
+                dropSpecific = 1;
+                dropSpecificSeq = atoi(optarg);
                 break;
 
             case 's' :
