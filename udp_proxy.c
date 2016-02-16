@@ -62,6 +62,7 @@ int delayByOne    = 0;                 /* delay packet by 1 */
 int dupePackets   = 0;                 /* duplicate all packets */
 int retxPacket = 0;                    /* specific seq to retransmit */
 int injectAlert = 0;                   /* inject an alert at end of epoch 0 */
+const char* selectedSide = NULL;       /* Forced side to use */
 
 typedef struct proxy_ctx {
     int  clientFd;       /* from client to proxy, downstream */
@@ -196,7 +197,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         if (delayByOne &&
             GetRecordEpoch(msg) == 0 &&
             GetRecordSeq(msg) == delayByOne &&
-            side == serverSide) {
+            side == selectedSide) {
 
             printf("*** delaying server packet %d\n", delayByOne);
             if (currDelay == NULL)
@@ -221,7 +222,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         }
 
         /* should we specifically drop the current packet from epoch 0 */
-        if (dropSpecific && side == serverSide &&
+        if (dropSpecific && side == selectedSide &&
             GetRecordEpoch(msg) == 0 &&
             GetRecordSeq(msg) == dropSpecificSeq) {
 
@@ -276,7 +277,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
             send(peerFd, msg, ret, 0);
 
         if (retxPacket && GetRecordEpoch(msg) == 0
-            && GetRecordSeq(msg) == retxPacket && side == serverSide) {
+            && GetRecordSeq(msg) == retxPacket && side == selectedSide) {
 
             IncrementRecordSeq(msg);
             IncrementRecordSeq(msg+14);
@@ -287,7 +288,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         if (delayByOne &&
             GetRecordEpoch(msg) == 0 &&
             GetRecordSeq(msg) > delayByOne &&
-            side == serverSide &&
+            side == selectedSide &&
             currDelay) {
 
             printf("*** sending on delayed packet\n");
@@ -387,12 +388,15 @@ static void Usage(void)
     printf("-p <num>            Proxy port to 'listen' on\n");
     printf("-s <server:port>    Server address in dotted decimal:port\n");
     printf("-d <num>            Drop every <num> packet, default 0\n");
-    printf("-x <num>            Drop specifically packet with sequence <num> from epoch 0\n");
+    printf("-x <num>            "
+           "Drop specifically packet with sequence <num> from epoch 0\n");
     printf("-y <num>            Delay every <num> packet, default 0\n");
-    printf("-b <num>            Delay specific packet with sequence <num> by 1\n");
+    printf("-b <num>            "
+           "Delay specific packet with sequence <num> by 1\n");
     printf("-D                  Duplicate all packets\n");
     printf("-R <num>            Retransmit packet sequence <num>\n");
     printf("-a                  Inject clear alert from client after CCS\n");
+    printf("-S <client|server>  Force side (default: server)\n");
 }
 
 
@@ -403,7 +407,7 @@ int main(int argc, char** argv)
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = getopt(argc, argv, "?Dap:s:d:y:x:b:R:")) != -1) {
+    while ( (ch = getopt(argc, argv, "?Dap:s:d:y:x:b:R:S:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -447,6 +451,17 @@ int main(int argc, char** argv)
                 injectAlert = 1;
                 break;
 
+            case 'S':
+                if (strcmp(optarg, clientSide) == 0)
+                    selectedSide = clientSide;
+                else if (strcmp(optarg, serverSide) == 0)
+                    selectedSide = serverSide;
+                else {
+                    Usage();
+                    exit(EX_USAGE);
+                }
+                break;
+
             default:
                 Usage();
                 exit(EX_USAGE);
@@ -465,6 +480,9 @@ int main(int argc, char** argv)
         Usage();
         exit(EX_USAGE);
     }
+
+    if (selectedSide == NULL)
+        selectedSide = serverSide;
 
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
