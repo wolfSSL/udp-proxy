@@ -32,18 +32,32 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
-#include <unistd.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <sys/ioctl.h>
-#include <sys/time.h>
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <pthread.h>
-#include <sysexits.h>
 #include <assert.h>
+#ifndef _WIN32
+    #include <unistd.h>
+    #include <netdb.h>
+    #include <netinet/in.h>
+    #include <netinet/tcp.h>
+    #include <arpa/inet.h>
+    #include <sys/ioctl.h>
+    #include <sys/time.h>
+    #include <sys/socket.h>
+    #include <pthread.h>
+    #include <sysexits.h>
+    #define SOCKET_T int
+    #define SOCKLEN_T socklen_t
+    #define MY_EX_USAGE EX_USAGE
+    #define StartUDP()
+    #define INVALID_SOCKET (-1)
+#else
+    #include <winsock2.h>
+    #include <process.h>
+    #define SOCKET_T SOCKET
+    #define SOCKLEN_T int
+    #define MY_EX_USAGE 2
+    #define StartUDP() { WSADATA wsd; WSAStartup(0x0002, &wsd); }
+#endif
 
 #include <event2/event.h>
 
@@ -65,8 +79,8 @@ int injectAlert = 0;                   /* inject an alert at end of epoch 0 */
 const char* selectedSide = NULL;       /* Forced side to use */
 
 typedef struct proxy_ctx {
-    int  clientFd;       /* from client to proxy, downstream */
-    int  serverFd;       /* form server to proxy, upstream   */
+    SOCKET_T  clientFd;       /* from client to proxy, downstream */
+    SOCKET_T  serverFd;       /* form server to proxy, upstream   */
 } proxy_ctx;
 
 
@@ -74,7 +88,7 @@ typedef struct delay_packet {
     char           msg[MSG_SIZE];   /* msg to delay */
     int            msgLen;          /* msg size */
     int            sendCount;       /* msg count for when to stop the delay */
-    int            peerFd;          /* fd to later send on */
+    SOCKET_T       peerFd;          /* fd to later send on */
     proxy_ctx*     ctx;             /* associated context */
 } delay_packet;
 
@@ -85,10 +99,78 @@ delay_packet* currDelay = NULL;    /* current packet to delay */
 static char* serverSide = "server";
 static char* clientSide = "client";
 
-unsigned char bogusAlert[] =
+char bogusAlert[] =
 {
     0x15, 254, 253, 0, 0, 0, 0, 0, 0, 0, 69, 0, 2, 1, 10
 };
+
+
+int   myoptind;
+char* myoptarg;
+
+
+static int GetOpt(int argc, char** argv, const char* optstring)
+{
+    static char* next = NULL;
+
+    char  c;
+    char* cp;
+
+    if (myoptind == 0)
+        next = NULL;   /* we're starting new/over */
+
+    if (next == NULL || *next == '\0') {
+        if (myoptind == 0)
+            myoptind++;
+
+        if (myoptind >= argc || argv[myoptind][0] != '-' ||
+                                argv[myoptind][1] == '\0') {
+            myoptarg = NULL;
+            if (myoptind < argc)
+                myoptarg = argv[myoptind];
+
+            return -1;
+        }
+
+        if (strcmp(argv[myoptind], "--") == 0) {
+            myoptind++;
+            myoptarg = NULL;
+
+            if (myoptind < argc)
+                myoptarg = argv[myoptind];
+
+            return -1;
+        }
+
+        next = argv[myoptind];
+        next++;                  /* skip - */
+        myoptind++;
+    }
+
+    c  = *next++;
+    /* The C++ strchr can return a different value */
+    cp = (char*)strchr(optstring, c);
+
+    if (cp == NULL || c == ':')
+        return '?';
+
+    cp++;
+
+    if (*cp == ':') {
+        if (*next != '\0') {
+            myoptarg = next;
+            next     = NULL;
+        }
+        else if (myoptind < argc) {
+            myoptarg = argv[myoptind];
+            myoptind++;
+        }
+        else
+            return '?';
+    }
+
+    return c;
+}
 
 
 static char* GetRecordType(const char* msg)
@@ -178,7 +260,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
     else if (ret < 0)
         printf("read < 0\n");
     else {
-        int peerFd;
+        SOCKET_T peerFd;
         char* side;   /* from message side */
 
         if (ctx->serverFd == fd) {
@@ -258,7 +340,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
         if (injectAlert) {
             if (injectAlert == 1 && side == clientSide && msg[0] == 0x14) {
-                bogusAlert[10] = (unsigned char)(GetRecordSeq(msg) + 1);
+                bogusAlert[10] = (char)(GetRecordSeq(msg) + 1);
                 injectAlert = 2;
             }
             if (injectAlert == 2 && side == serverSide && msg[0] == 0x14) {
@@ -304,7 +386,7 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
 {
     int ret, on = 1;
     struct sockaddr_in client;
-    socklen_t len = sizeof(client);
+    SOCKLEN_T len = sizeof(client);
     char msg[MSG_SIZE];
     int  msgLen;
     struct event* cliEvent;
@@ -321,14 +403,16 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
     msgLen = recvfrom(fd, msg, MSG_SIZE, 0, (struct sockaddr*)&client, &len);
     printf("got %s from client, first msg\n", GetRecordType(msg));
     ctx->clientFd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (ctx->clientFd < 0) {
+    if (ctx->clientFd == INVALID_SOCKET) {
         perror("socket failed");
         exit(EXIT_FAILURE);
     }
 
-    setsockopt(ctx->clientFd,SOL_SOCKET,SO_REUSEADDR,&on,(socklen_t)sizeof(on));
+    setsockopt(ctx->clientFd, SOL_SOCKET, SO_REUSEADDR,
+               (char*)&on, (SOCKLEN_T)sizeof(on));
 #ifdef SO_REUSEPORT
-    setsockopt(ctx->clientFd,SOL_SOCKET,SO_REUSEPORT,&on,(socklen_t)sizeof(on));
+    setsockopt(ctx->clientFd, SOL_SOCKET, SO_REUSEPORT,
+               (char*)&on, (SOCKLEN_T)sizeof(on));
 #endif
 
     ret = bind(ctx->clientFd, (struct sockaddr*)&proxy, sizeof(proxy));
@@ -402,12 +486,13 @@ static void Usage(void)
 
 int main(int argc, char** argv)
 {
-    int sockfd, ret, ch, on = 1;
+    SOCKET_T sockfd;
+    int ret, ch, on = 1;
     struct event* mainEvent;
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = getopt(argc, argv, "?Dap:s:d:y:x:b:R:S:")) != -1) {
+    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -415,28 +500,28 @@ int main(int argc, char** argv)
                 break;
 
             case 'p' :
-                port = atoi(optarg);
+                port = atoi(myoptarg);
                 break;
 
             case 'd' :
-                dropPacket = atoi(optarg);
+                dropPacket = atoi(myoptarg);
                 break;
 
             case 'y' :
-                delayPacket = atoi(optarg);
+                delayPacket = atoi(myoptarg);
                 break;
 
             case 'x':
                 dropSpecific = 1;
-                dropSpecificSeq = atoi(optarg);
+                dropSpecificSeq = atoi(myoptarg);
                 break;
 
             case 's' :
-                serverString = optarg;
+                serverString = myoptarg;
                 break;
 
             case 'b':
-                delayByOne = atoi(optarg);
+                delayByOne = atoi(myoptarg);
                 break;
 
             case 'D' :
@@ -444,7 +529,7 @@ int main(int argc, char** argv)
                 break;
 
             case 'R' :
-                retxPacket = atoi(optarg);
+                retxPacket = atoi(myoptarg);
                 break;
 
             case 'a':
@@ -452,19 +537,19 @@ int main(int argc, char** argv)
                 break;
 
             case 'S':
-                if (strcmp(optarg, clientSide) == 0)
+                if (strcmp(myoptarg, clientSide) == 0)
                     selectedSide = clientSide;
-                else if (strcmp(optarg, serverSide) == 0)
+                else if (strcmp(myoptarg, serverSide) == 0)
                     selectedSide = serverSide;
                 else {
                     Usage();
-                    exit(EX_USAGE);
+                    exit(MY_EX_USAGE);
                 }
                 break;
 
             default:
                 Usage();
-                exit(EX_USAGE);
+                exit(MY_EX_USAGE);
                 break;
         }
     }
@@ -472,17 +557,19 @@ int main(int argc, char** argv)
     if (port == -1) {
         printf("need to set 'listen port'\n");
         Usage();
-        exit(EX_USAGE);
+        exit(MY_EX_USAGE);
     }
 
     if (serverString == NULL) {
         printf("need to set server address string\n");
         Usage();
-        exit(EX_USAGE);
+        exit(MY_EX_USAGE);
     }
 
     if (selectedSide == NULL)
         selectedSide = serverSide;
+
+    StartUDP();
 
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
@@ -502,9 +589,11 @@ int main(int argc, char** argv)
         exit(EXIT_FAILURE);
     }
 
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, (socklen_t)sizeof(on));
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR,
+               (char*)&on, (SOCKLEN_T)sizeof(on));
 #ifdef SO_REUSEPORT
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &on, (socklen_t)sizeof(on));
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT,
+               (char*)&on, (SOCKLEN_T)sizeof(on));
 #endif
 
     ret = bind(sockfd, (struct sockaddr*)&proxy, sizeof(proxy));

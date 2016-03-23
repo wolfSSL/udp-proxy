@@ -1,1 +1,9 @@
 udp_proxy
+*.suo
+*.sdf
+*.user
+*.opensdf
+x64
+Win32
+Release
+Debug
