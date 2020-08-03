@@ -65,13 +65,18 @@
 /* datagram msg size */
 #define MSG_SIZE 1500 
 
+#define SET_YELLOW printf("\033[0;33m")
+#define SET_BLUE printf("\033[0;34m")
+#define RESET_COLOR printf("\033[0m");
+
 struct event_base* base;               /* main base */
 struct sockaddr_in proxy, server;      /* proxy address and server address */
 int serverLen = sizeof(server);        /* server address len */
 int dropPacket    = 0;                 /* dropping packet interval */
 int delayPacket   = 0;                 /* delay packet interval */
-int dropSpecific  = 0;                 /* specific seq to drop in epoch 0 */
-int dropSpecificSeq  = 0;              /* specific seq to drop in epoch 0 */
+int dropSpecific  = 0;                 /* specific seq to drop in epoch */
+int dropSpecificSeq  = 0;              /* specific seq to drop */
+int dropSpecificEpoch = 0;             /* specific epoch to drop in */
 int delayByOne    = 0;                 /* delay packet by 1 */
 int dupePackets   = 0;                 /* duplicate all packets */
 int retxPacket = 0;                    /* specific seq to retransmit */
@@ -266,13 +271,16 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         if (ctx->serverFd == fd) {
             peerFd = ctx->clientFd;
             side   = serverSide;
+            SET_BLUE;
         }
         else {
             peerFd = ctx->serverFd;
             side   = clientSide;
+            SET_YELLOW;
         }
 
-        printf("got %s from %s\n", GetRecordType(msg), side);
+        printf("%s: E: %d Seq: %2d handshake: %2d got %s read %d bytes\n", side, GetRecordEpoch(msg), GetRecordSeq(msg), msg[18], GetRecordType(msg), ret);
+        RESET_COLOR;
 
         msgCount++;
 
@@ -305,9 +313,8 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
         /* should we specifically drop the current packet from epoch 0 */
         if (dropSpecific && side == selectedSide &&
-            GetRecordEpoch(msg) == 0 &&
+            GetRecordEpoch(msg) == dropSpecificEpoch &&
             GetRecordSeq(msg) == dropSpecificSeq) {
-
             printf("*** but dropping this packet specifically\n");
             return;
         }
@@ -401,7 +408,9 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
     /* let's 'connect' to client so main loop doesn't hear about this
        'connection' again, also allows pairing with upStream 'connect' */
     msgLen = recvfrom(fd, msg, MSG_SIZE, 0, (struct sockaddr*)&client, &len);
-    printf("got %s from client, first msg\n", GetRecordType(msg));
+    SET_YELLOW;
+    printf("%s: got %s, first msg\n", clientSide, GetRecordType(msg));
+    RESET_COLOR;
     ctx->clientFd = socket(AF_INET, SOCK_DGRAM, 0);
     if (ctx->clientFd == INVALID_SOCKET) {
         perror("socket failed");
@@ -472,8 +481,8 @@ static void Usage(void)
     printf("-p <num>            Proxy port to 'listen' on\n");
     printf("-s <server:port>    Server address in dotted decimal:port\n");
     printf("-d <num>            Drop every <num> packet, default 0\n");
-    printf("-x <num>            "
-           "Drop specifically packet with sequence <num> from epoch 0\n");
+    printf("-x <epoch>:<num>    "
+           "Drop specifically packet with sequence <num> from <epoch>\n");
     printf("-y <num>            Delay every <num> packet, default 0\n");
     printf("-b <num>            "
            "Delay specific packet with sequence <num> by 1\n");
@@ -513,7 +522,8 @@ int main(int argc, char** argv)
 
             case 'x':
                 dropSpecific = 1;
-                dropSpecificSeq = atoi(myoptarg);
+                dropSpecificEpoch = atoi(myoptarg);
+                dropSpecificSeq = atoi(strchr(myoptarg, ':') + 1);
                 break;
 
             case 's' :
