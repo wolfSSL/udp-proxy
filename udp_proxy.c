@@ -82,6 +82,7 @@ int dupePackets   = 0;                 /* duplicate all packets */
 int retxPacket = 0;                    /* specific seq to retransmit */
 int injectAlert = 0;                   /* inject an alert at end of epoch 0 */
 const char* selectedSide = NULL;       /* Forced side to use */
+const char* seqOrder = NULL;           /* how to reorder 0th epoch packets */
 
 typedef struct proxy_ctx {
     SOCKET_T  clientFd;       /* from client to proxy, downstream */
@@ -250,6 +251,80 @@ static void IncrementRecordSeq(char* msg)
     }
 }
 
+static void logMsg(char* side, char* msg, int msgSz)
+{
+    printf("%s: E: %d Seq: %2d handshake: %2d got %s read %d bytes\n", side, GetRecordEpoch(msg), GetRecordSeq(msg), msg[18], GetRecordType(msg), msgSz);
+}
+
+typedef struct pkt {
+    char bin[MSG_SIZE];
+    int binSz;
+    struct pkt* next;
+} pkt;
+static pkt* pktStore = NULL;
+
+static void pushPkt(char* msg, int msgSz)
+{
+    if (msg && msgSz > 0) {
+        pkt* tmp;
+        pkt* new = (pkt*)malloc(sizeof(pkt));
+        if (new == NULL)
+            return;
+        printf("Storing pkt with seq %d\n", GetRecordSeq(msg));
+        memset(new, 0, sizeof(pkt));
+        memcpy(new->bin, msg, msgSz);
+        new->binSz = msgSz;
+        if (pktStore == NULL) {
+            pktStore = new;
+        }
+        else {
+            tmp = pktStore;
+            while (tmp->next != NULL)
+                tmp = tmp->next;
+            tmp->next = new;
+        }
+    }
+}
+
+static void pktStoreDrain(char* side, SOCKET_T peerFd) {
+    pkt* tmp = pktStore;
+    pkt* prev = NULL;
+    pktStore = NULL;
+    while (tmp != NULL) {
+        logMsg(side, tmp->bin, tmp->binSz);
+        send(peerFd, tmp->bin, tmp->binSz, 0);
+        prev = tmp;
+        tmp = tmp->next;
+        free(prev);
+    }
+}
+
+static void pktStoreSend(char* side, SOCKET_T peerFd) {
+    while (*seqOrder != '\0') {
+        pkt* tmp = pktStore;
+        pkt* prev = NULL;
+        int seq = *seqOrder - '0';
+        while (tmp != NULL) {
+            if (GetRecordSeq(tmp->bin) == seq) {
+                logMsg(side, tmp->bin, tmp->binSz);
+                send(peerFd, tmp->bin, tmp->binSz, 0);
+                seqOrder++;
+                if (prev != NULL)
+                    prev->next = tmp->next;
+                else if (tmp->next != NULL)
+                    pktStore = tmp->next;
+                else
+                    pktStore = NULL;
+                free(tmp);
+                break;
+            }
+            prev = tmp;
+            tmp = tmp->next;
+        }
+        if (tmp == NULL)
+            return;
+    }
+}
 
 /* msg callback, send along to peer or do manipulation */
 static void Msg(evutil_socket_t fd, short which, void* arg)
@@ -271,15 +346,29 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         if (ctx->serverFd == fd) {
             peerFd = ctx->clientFd;
             side   = serverSide;
-            SET_BLUE;
         }
         else {
             peerFd = ctx->serverFd;
             side   = clientSide;
-            SET_YELLOW;
         }
 
-        printf("%s: E: %d Seq: %2d handshake: %2d got %s read %d bytes\n", side, GetRecordEpoch(msg), GetRecordSeq(msg), msg[18], GetRecordType(msg), ret);
+        if (side == selectedSide && GetRecordEpoch(msg) == 0 
+                && *seqOrder != '\0') {
+            int seq = *seqOrder - '0';
+            if (GetRecordSeq(msg) != seq) {
+                pushPkt(msg, ret);
+                return;
+            }
+            else {
+                seqOrder++;
+            }
+        }
+
+        if (side == serverSide)
+            SET_BLUE;
+        else
+            SET_YELLOW;
+        logMsg(side, msg, ret);
         RESET_COLOR;
 
         msgCount++;
@@ -337,13 +426,26 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         }
 
         /* should we drop current packet altogether */
-        if (dropPacket && (msgCount % dropPacket) == 0) {
+        if (dropPacket && (msgCount % dropPacket) == 0 
+             && msg[0] != 0x17 /* But don't drop application data */) {
             printf("*** but dropping this packet\n");
             return;
         }
 
         /* forward along */
         send(peerFd, msg, ret, 0);
+        
+        if (side == selectedSide) {
+            if (side == serverSide)
+                SET_BLUE;
+            else
+                SET_YELLOW;
+            if (GetRecordEpoch(msg) == 0 && *seqOrder != '\0')
+                pktStoreSend(side, peerFd);
+            else
+                pktStoreDrain(side, peerFd);
+            RESET_COLOR;
+        }
 
         if (injectAlert) {
             if (injectAlert == 1 && side == clientSide && msg[0] == 0x14) {
@@ -489,6 +591,8 @@ static void Usage(void)
     printf("-D                  Duplicate all packets\n");
     printf("-R <num>            Retransmit packet sequence <num>\n");
     printf("-a                  Inject clear alert from client after CCS\n");
+    printf("-r <pkt seq>        Re-order packets from zeroth epoch in this order\n"
+           "                    ex: 146523\n");
     printf("-S <client|server>  Force side (default: server)\n");
 }
 
@@ -501,7 +605,7 @@ int main(int argc, char** argv)
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:")) != -1) {
+    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:r:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -540,6 +644,18 @@ int main(int argc, char** argv)
 
             case 'R' :
                 retxPacket = atoi(myoptarg);
+                break;
+
+            case 'r' :
+                {
+                    const char* c = seqOrder = myoptarg;
+                    for (; *c != '\0'; c++) {
+                        if (*c > '9' || *c < '0') {
+                            Usage();
+                            exit(MY_EX_USAGE);
+                        }
+                    }
+                }
                 break;
 
             case 'a':
