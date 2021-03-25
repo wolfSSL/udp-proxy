@@ -82,7 +82,7 @@ int dupePackets   = 0;                 /* duplicate all packets */
 int retxPacket = 0;                    /* specific seq to retransmit */
 int injectAlert = 0;                   /* inject an alert at end of epoch 0 */
 const char* selectedSide = NULL;       /* Forced side to use */
-const char* seqOrder = NULL;           /* how to reorder 0th epoch packets */
+const char* seqOrder = "";             /* how to reorder 0th epoch packets */
 
 typedef struct proxy_ctx {
     SOCKET_T  clientFd;       /* from client to proxy, downstream */
