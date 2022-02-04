@@ -90,6 +90,8 @@ typedef struct proxy_ctx {
 
     struct bufferevent* cliEvent;
     struct bufferevent* srvEvent;
+
+    int msgCount;
 } proxy_ctx;
 
 
@@ -332,13 +334,9 @@ static void pktStoreSend(char* side, SOCKET_T peerFd)
 /* msg callback, send along to peer or do manipulation */
 static void msgCb(struct bufferevent *bev, void *arg)
 {
-    static int msgCount = 0;
-
     char       msg[MSG_SIZE];
     proxy_ctx* ctx = (proxy_ctx*)arg;
     int        ret;
-    
-    
     
     ret = bufferevent_read(bev, msg, sizeof(msg));
     if (ret == 0) {
@@ -379,7 +377,7 @@ static void msgCb(struct bufferevent *bev, void *arg)
         logMsg(side, msg, ret);
         RESET_COLOR();
 
-        msgCount++;
+        ctx->msgCount++;
 
         if (delayByOne &&
             GetRecordEpoch(msg) == 0 &&
@@ -395,14 +393,14 @@ static void msgCb(struct bufferevent *bev, void *arg)
             }
             memcpy(currDelay->msg, msg, ret);
             currDelay->msgLen = ret;
-            currDelay->sendCount = msgCount + delayPacket;
+            currDelay->sendCount = ctx->msgCount + delayPacket;
             currDelay->peerFd = peerFd;
             currDelay->ctx = ctx;
             return;
         }
 
         /* is it now time to send along delayed packet */
-        if (delayPacket && currDelay && currDelay->sendCount == msgCount) {
+        if (delayPacket && currDelay && currDelay->sendCount == ctx->msgCount) {
             printf("*** sending on delayed packet\n");
             send(currDelay->peerFd, currDelay->msg, currDelay->msgLen, 0);
             currDelay = NULL;
@@ -417,7 +415,7 @@ static void msgCb(struct bufferevent *bev, void *arg)
         }
 
         /* should we delay the current packet */
-        if (delayPacket && (msgCount % delayPacket) == 0) {
+        if (delayPacket && (ctx->msgCount % delayPacket) == 0) {
             printf("*** but delaying this packet\n");
             if (currDelay == NULL)
                currDelay = &tmpDelay;
@@ -427,15 +425,14 @@ static void msgCb(struct bufferevent *bev, void *arg)
             }
             memcpy(currDelay->msg, msg, ret);
             currDelay->msgLen = ret;
-            currDelay->sendCount = msgCount + delayPacket;
+            currDelay->sendCount = ctx->msgCount + delayPacket;
             currDelay->peerFd = peerFd;
             currDelay->ctx = ctx;
             return;
         }
 
         /* should we drop current packet altogether */
-        if (dropPacket && (msgCount % dropPacket) == 0
-             && msg[0] != 0x17 /* But don't drop application data */) {
+        if (dropPacket && (ctx->msgCount % dropPacket) == 0) {
             printf("*** but dropping this packet\n");
             return;
         }
@@ -528,6 +525,7 @@ static void newClientCb(evutil_socket_t fd, short which, void* arg)
         perror("malloc failed");
         exit(EXIT_FAILURE);
     }
+    memset(ctx, 0, sizeof(proxy_ctx));
 
     /* accept new client connection */
     ctx->clientFd = accept(fd, (struct sockaddr*)&client, &len);
