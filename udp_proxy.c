@@ -74,6 +74,8 @@ struct sockaddr_in proxy, server;      /* proxy address and server address */
 int serverLen = sizeof(server);        /* server address len */
 int dropPacket    = 0;                 /* dropping packet interval */
 int delayPacket   = 0;                 /* delay packet interval */
+int dropNth = 0;
+int dropPacketNo = 0;
 int dropSpecific  = 0;                 /* specific seq to drop in epoch */
 int dropSpecificSeq  = 0;              /* specific seq to drop */
 int dropSpecificEpoch = 0;             /* specific epoch to drop in */
@@ -408,6 +410,11 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
             return;
         }
 
+        if (dropNth && dropPacketNo == msgCount) {
+            printf("*** but dropping the %d packet\n", msgCount);
+            return;
+        }
+
         /* should we delay the current packet */
         if (delayPacket && (msgCount % delayPacket) == 0) {
             printf("*** but delaying this packet\n");
@@ -566,6 +573,11 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
     }
     event_add(srvEvent, NULL);
 
+    if (dropNth && dropPacketNo == 0) {
+        printf("*** but dropping this packet\n");
+        return;
+    }
+
     /* send along initial client message */
     ret = send(ctx->serverFd, msg, msgLen, 0);
     if (ret < 0) {
@@ -583,6 +595,7 @@ static void Usage(void)
     printf("-p <num>            Proxy port to 'listen' on\n");
     printf("-s <server:port>    Server address in dotted decimal:port\n");
     printf("-d <num>            Drop every <num> packet, default 0\n");
+    printf("-f <num>            Drop the <num> packet, default none\n");
     printf("-x <epoch>:<num>    "
            "Drop specifically packet with sequence <num> from <epoch>\n");
     printf("-y <num>            Delay every <num> packet, default 0\n");
@@ -605,7 +618,7 @@ int main(int argc, char** argv)
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:r:")) != -1) {
+    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:r:f:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -673,6 +686,10 @@ int main(int argc, char** argv)
                 }
                 break;
 
+            case 'f':
+                dropNth = 1;
+                dropPacketNo = atoi(myoptarg);
+                break;
             default:
                 Usage();
                 exit(MY_EX_USAGE);
