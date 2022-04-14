@@ -34,6 +34,8 @@
 #include <string.h>
 #include <sys/types.h>
 #include <assert.h>
+#include <math.h>
+#include <locale.h>
 #ifndef _WIN32
     #include <unistd.h>
     #include <netdb.h>
@@ -88,6 +90,7 @@ int injectAlert = 0;                   /* inject an alert at end of epoch 0 */
 int isDtls13 = 0;
 const char* selectedSide = NULL;       /* Forced side to use */
 const char* seqOrder = "";             /* how to reorder 0th epoch packets */
+const char* delayOrder = "";           /* how to reorder 0th epoch packets */
 
 #define LOG(...)                            \
         do {                                \
@@ -118,9 +121,25 @@ typedef struct delay_packet {
 delay_packet  tmpDelay;            /* our tmp holder */
 delay_packet* currDelay = NULL;    /* current packet to delay */
 
+typedef struct time_delay_packet {
+    SOCKET_T       fd;              /* file descriptor to send to */
+    char           msg[MSG_SIZE];   /* msg to delay */
+    int            msgLen;          /* msg size */
+    struct event*  ev;              /* event that needs to be cleaned up after
+                                     * the timeout expires */
+    char*          side;
+    int            pktIdx;
+} time_delay_packet;
+
+typedef struct event_list {
+    struct event* ev;
+    struct event_list* next;
+} event_list;
 
 static char* serverSide = "server";
 static char* clientSide = "client";
+
+event_list evCleanupList = { NULL, NULL };
 
 char bogusAlert[] =
 {
@@ -357,6 +376,56 @@ static void pktStoreSend(char* side, SOCKET_T peerFd) {
     }
 }
 
+static void clearEventList(void)
+{
+    event_list* list;
+    for (list = &evCleanupList; list != NULL; list = list->next) {
+        if (list->ev != NULL)
+            event_free(list->ev);
+    }
+    list = evCleanupList.next;
+    evCleanupList.ev = NULL;
+    evCleanupList.next = NULL;
+    for (; list != NULL; list = list->next)
+        free(list);
+}
+
+static void addEventToCleanupList(struct event* ev)
+{
+    if (evCleanupList.ev == NULL)
+        evCleanupList.ev = ev;
+    else {
+        event_list* list = &evCleanupList;
+        while (list->next != NULL)
+            list = list->next;
+        list->next = (event_list*)malloc(sizeof(event_list));
+        if (list->next == NULL) {
+            perror("malloc failed");
+            exit(EXIT_FAILURE);
+        }
+        list->next->ev = ev;
+        list->next->next = NULL;
+    }
+}
+
+static void sendTimeDelayedPkt(evutil_socket_t fd, short flags, void* arg)
+{
+    time_delay_packet* tctx = (time_delay_packet*)arg;
+
+    clearEventList();
+
+    if (tctx->side == serverSide)
+        SET_BLUE;
+    else
+        SET_YELLOW;
+    logMsg(tctx->side, tctx->msg, tctx->msgLen, tctx->pktIdx);
+    RESET_COLOR;
+    send(tctx->fd, tctx->msg, tctx->msgLen, 0);
+
+    /* Add event to cleanup queue */
+    addEventToCleanupList(tctx->ev);
+}
+
 /* msg callback, send along to peer or do manipulation */
 static void Msg(evutil_socket_t fd, short which, void* arg)
 {
@@ -367,6 +436,8 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
     char       msg[MSG_SIZE];
     proxy_ctx* ctx = (proxy_ctx*)arg;
     int        ret = recv(fd, msg, MSG_SIZE, 0);
+
+    clearEventList();
 
     if (ret == 0)
         LOG("read 0\n");
@@ -416,6 +487,45 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
                     seqOrder++;
                 }
             }
+        }
+
+        if (*delayOrder != '\0') {
+            /* We need to delay this packet */
+            struct event* ev;
+            double t = strtod(delayOrder, (char**)&delayOrder);
+            time_delay_packet* tctx =
+                    (time_delay_packet*)malloc(sizeof(time_delay_packet));
+            struct timeval timeout = { 0 };
+
+            if (tctx == NULL) {
+                perror("malloc failed");
+                exit(EXIT_FAILURE);
+            }
+
+            if (*delayOrder == ',')
+                delayOrder++;
+
+            memcpy(tctx->msg, msg, ret);
+            tctx->msgLen = ret;
+            tctx->fd = peerFd;
+            tctx->side = side;
+            tctx->pktIdx = peerIdx[sideIdx];
+
+            LOG("*** delaying packet %d by %f seconds\n", peerIdx[sideIdx], t);
+            timeout.tv_usec = (int)(modf(t, &t) * 1000000.0);
+            timeout.tv_sec = (int)t;
+
+            ev = evtimer_new(base, sendTimeDelayedPkt, tctx);
+            if (ev == NULL) {
+                perror("evtimer_new failed");
+                exit(EXIT_FAILURE);
+            }
+            tctx->ev = ev;
+            if (evtimer_add(ev, &timeout) != 0) {
+                perror("evtimer_add failed");
+                exit(EXIT_FAILURE);
+            }
+            return;
         }
 
         if (side == serverSide)
@@ -661,6 +771,8 @@ static void Usage(void)
     printf("-S <client|server>  Force side (default: server)\n");
     printf("-u                  Interpret traffic as DTLS 1.3\n");
     printf("-l <log file>       Use the provided argument as the log file\n");
+    printf("-t <delays>         Comma seperated list of delays for each \n"
+           "                    subsequent packet in seconds.\n");
 }
 
 
@@ -672,7 +784,9 @@ int main(int argc, char** argv)
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:r:f:ul:")) != -1) {
+    setlocale(LC_ALL, ""); /* Make portable */
+
+    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:r:f:ul:t:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -721,6 +835,25 @@ int main(int argc, char** argv)
                             Usage();
                             exit(MY_EX_USAGE);
                         }
+                    }
+                }
+                break;
+
+            case 't' :
+                {
+                    const char* c = delayOrder = myoptarg;
+                    while (*c != '\0') {
+                        double d = strtod(c, (char**)&c);
+                        if (d == 0.0) {
+                            Usage();
+                            exit(MY_EX_USAGE);
+                        }
+                        if (*c == ',')
+                            c++;
+                    }
+                    if (*c != '\0') {
+                        Usage();
+                        exit(MY_EX_USAGE);
                     }
                 }
                 break;
