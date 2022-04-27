@@ -389,7 +389,7 @@ static void clearEventList(void)
     list = evCleanupList.next;
     evCleanupList.ev = NULL;
     evCleanupList.next = NULL;
-    for (next = list->next; list != NULL; list = next) {
+    for (; list != NULL; list = next) {
         next = list->next;
         free(list);
     }
@@ -429,6 +429,7 @@ static void sendTimeDelayedPkt(evutil_socket_t fd, short flags, void* arg)
 
     /* Add event to cleanup queue */
     addEventToCleanupList(tctx->ev);
+    free(tctx);
 }
 
 /* msg callback, send along to peer or do manipulation */
