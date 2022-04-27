@@ -381,6 +381,7 @@ static void pktStoreSend(char* side, SOCKET_T peerFd) {
 static void clearEventList(void)
 {
     event_list* list;
+    event_list* next;
     for (list = &evCleanupList; list != NULL; list = list->next) {
         if (list->ev != NULL)
             event_free(list->ev);
@@ -388,8 +389,10 @@ static void clearEventList(void)
     list = evCleanupList.next;
     evCleanupList.ev = NULL;
     evCleanupList.next = NULL;
-    for (; list != NULL; list = list->next)
+    for (next = list->next; list != NULL; list = next) {
+        next = list->next;
         free(list);
+    }
 }
 
 static void addEventToCleanupList(struct event* ev)
