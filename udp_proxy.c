@@ -79,6 +79,8 @@ int serverLen = sizeof(server);        /* server address len */
 int dropPacket    = 0;                 /* dropping packet interval */
 int delayPacket   = 0;                 /* delay packet interval */
 int dropNth = 0;
+int dropBySize = 0;                    /* drop first packet of specific size */
+int dropSize = 0;                      /* specific size to drop */
 int dropPacketNo = 0;
 int dropSpecific  = 0;                 /* specific seq to drop in epoch */
 int dropSpecificSeq  = 0;              /* specific seq to drop */
@@ -577,6 +579,12 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
             return;
         }
 
+        if (dropBySize && ret == dropSize) {
+            LOG("*** but dropping the %d packet of size %d\n", msgCount, ret);
+            dropBySize = 0;
+            return;
+        }
+
         /* should we delay the current packet */
         if (delayPacket && (msgCount % delayPacket) == 0) {
             LOG("*** but delaying this packet\n");
@@ -773,6 +781,7 @@ static void Usage(void)
     printf("-l <log file>       Use the provided argument as the log file\n");
     printf("-t <delays>         Comma seperated list of delays for each \n"
            "                    subsequent packet in seconds.\n");
+    printf("-F <size>           Drop first packet of <size> bytes\n");
 }
 
 
@@ -786,7 +795,7 @@ int main(int argc, char** argv)
 
     setlocale(LC_ALL, ""); /* Make portable */
 
-    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:r:f:ul:t:")) != -1) {
+    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:r:f:ul:t:F:")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -876,6 +885,11 @@ int main(int argc, char** argv)
             case 'f':
                 dropNth = 1;
                 dropPacketNo = atoi(myoptarg);
+                break;
+
+            case 'F':
+                dropBySize = 1;
+                dropSize = atoi(myoptarg);
                 break;
 
             case 'u':
