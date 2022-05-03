@@ -90,6 +90,7 @@ int dupePackets   = 0;                 /* duplicate all packets */
 int retxPacket = 0;                    /* specific seq to retransmit */
 int injectAlert = 0;                   /* inject an alert at end of epoch 0 */
 int isDtls13 = 0;
+int whitelistAppData = 0;              /* never drop application data */
 const char* selectedSide = NULL;       /* Forced side to use */
 const char* seqOrder = "";             /* how to reorder 0th epoch packets */
 const char* delayOrder = "";           /* how to reorder 0th epoch packets */
@@ -142,6 +143,9 @@ static char* serverSide = "server";
 static char* clientSide = "client";
 
 event_list evCleanupList = { NULL, NULL };
+
+#define CLIENT_APP_DATA_SIZE 36
+#define SERVER_APP_DATA_SIZE 44
 
 char bogusAlert[] =
 {
@@ -442,6 +446,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
     char       msg[MSG_SIZE];
     proxy_ctx* ctx = (proxy_ctx*)arg;
     int        ret = recv(fd, msg, MSG_SIZE, 0);
+    int whiteList = 0;
 
     clearEventList();
 
@@ -495,6 +500,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
             }
         }
 
+
         if (*delayOrder != '\0') {
             /* We need to delay this packet */
             struct event* ev;
@@ -543,6 +549,11 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
         msgCount++;
 
+        if (whitelistAppData &&
+            ((side == serverSide && ret == SERVER_APP_DATA_SIZE) ||
+             (side == clientSide && ret == CLIENT_APP_DATA_SIZE)))
+            whiteList = 1;
+
         if (delayByOne &&
             GetRecordEpoch(msg) == 0 &&
             GetRecordSeq(msg) == delayByOne &&
@@ -573,17 +584,17 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         /* should we specifically drop the current packet from epoch 0 */
         if (dropSpecific && side == selectedSide &&
             GetRecordEpoch(msg) == dropSpecificEpoch &&
-            GetRecordSeq(msg) == dropSpecificSeq) {
+            GetRecordSeq(msg) == dropSpecificSeq && !whiteList) {
             LOG("*** but dropping this packet specifically\n");
             return;
         }
 
-        if (dropNth && dropPacketNo == msgCount) {
+        if (dropNth && dropPacketNo == msgCount && !whiteList) {
             LOG("*** but dropping the %d packet\n", msgCount);
             return;
         }
 
-        if (dropBySize && ret == dropSize) {
+        if (dropBySize && ret == dropSize && !whiteList) {
             LOG("*** but dropping the %d packet of size %d\n", msgCount, ret);
             dropBySize = 0;
             return;
@@ -608,14 +619,15 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
         /* should we drop current packet altogether */
         if (dropPacket && (msgCount % dropPacket) == 0 
-             && msg[0] != 0x17 /* But don't drop application data */) {
+             && msg[0] != 0x17 /* But don't drop application data */
+            && !whiteList) {
             LOG("*** but dropping this packet\n");
             return;
         }
 
         /* forward along */
         send(peerFd, msg, ret, 0);
-        
+
         if (side == selectedSide) {
             if (side == serverSide)
                 SET_BLUE;
@@ -786,6 +798,7 @@ static void Usage(void)
     printf("-t <delays>         Comma seperated list of delays for each \n"
            "                    subsequent packet in seconds.\n");
     printf("-F <size>           Drop first packet of <size> bytes\n");
+    printf("-w                  Don't drop packet with same size of application data packet of wolfSSL examples\n");
 }
 
 
@@ -799,7 +812,7 @@ int main(int argc, char** argv)
 
     setlocale(LC_ALL, ""); /* Make portable */
 
-    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:r:f:ul:t:F:")) != -1) {
+    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:r:f:ul:t:F:w")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -902,6 +915,10 @@ int main(int argc, char** argv)
 
             case 'l':
                 logFile = myoptarg;
+                break;
+
+            case 'w':
+                whitelistAppData = 1;
                 break;
 
             default:
