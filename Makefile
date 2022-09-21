@@ -1,7 +1,6 @@
 CC=gcc
-WOLF_INSTALL_DIR=/usr/local
-CFLAGS=-I$(WOLF_INSTALL_DIR)/include -Wall
-LIBS=-L$(WOLF_INSTALL_DIR)/lib -lwolfssl -levent
+CFLAGS=-Wall
+LIBS=-levent
 
 all:udp_proxy tcp_proxy
 
