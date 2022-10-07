@@ -34,6 +34,8 @@
 #include <string.h>
 #include <sys/types.h>
 #include <assert.h>
+#include <math.h>
+#include <locale.h>
 #ifndef _WIN32
     #include <unistd.h>
     #include <netdb.h>
@@ -48,6 +50,7 @@
     #define SOCKET_T int
     #define SOCKLEN_T socklen_t
     #define MY_EX_USAGE EX_USAGE
+    #define MY_EX_IOERR EX_IOERR
     #define StartUDP()
     #define INVALID_SOCKET (-1)
 #else
@@ -56,6 +59,7 @@
     #define SOCKET_T SOCKET
     #define SOCKLEN_T int
     #define MY_EX_USAGE 2
+    #define MY_EX_IOERR 3
     #define StartUDP() { WSADATA wsd; WSAStartup(0x0002, &wsd); }
 #endif
 
@@ -63,7 +67,7 @@
 
 
 /* datagram msg size */
-#define MSG_SIZE 1500 
+#define MSG_SIZE 2000
 
 #define SET_YELLOW printf("\033[0;33m")
 #define SET_BLUE printf("\033[0;34m")
@@ -74,6 +78,10 @@ struct sockaddr_in proxy, server;      /* proxy address and server address */
 int serverLen = sizeof(server);        /* server address len */
 int dropPacket    = 0;                 /* dropping packet interval */
 int delayPacket   = 0;                 /* delay packet interval */
+int dropNth = 0;
+int dropBySize = 0;                    /* drop first packet of specific size */
+int dropSize = 0;                      /* specific size to drop */
+int dropPacketNo = 0;
 int dropSpecific  = 0;                 /* specific seq to drop in epoch */
 int dropSpecificSeq  = 0;              /* specific seq to drop */
 int dropSpecificEpoch = 0;             /* specific epoch to drop in */
@@ -81,8 +89,23 @@ int delayByOne    = 0;                 /* delay packet by 1 */
 int dupePackets   = 0;                 /* duplicate all packets */
 int retxPacket = 0;                    /* specific seq to retransmit */
 int injectAlert = 0;                   /* inject an alert at end of epoch 0 */
+int isDtls13 = 0;
+int whitelistAppData = 0;              /* never drop application data */
 const char* selectedSide = NULL;       /* Forced side to use */
 const char* seqOrder = "";             /* how to reorder 0th epoch packets */
+const char* delayOrder = "";           /* how to reorder 0th epoch packets */
+
+#define LOG(...)                            \
+        do {                                \
+            if (fp != NULL) {               \
+                fprintf(fp, __VA_ARGS__);   \
+                fflush(fp);                 \
+            }                               \
+            else                            \
+                printf(__VA_ARGS__);        \
+        } while(0)
+FILE *fp = NULL;
+const char* logFile = NULL;
 
 typedef struct proxy_ctx {
     SOCKET_T  clientFd;       /* from client to proxy, downstream */
@@ -101,9 +124,28 @@ typedef struct delay_packet {
 delay_packet  tmpDelay;            /* our tmp holder */
 delay_packet* currDelay = NULL;    /* current packet to delay */
 
+typedef struct time_delay_packet {
+    SOCKET_T       fd;              /* file descriptor to send to */
+    char           msg[MSG_SIZE];   /* msg to delay */
+    int            msgLen;          /* msg size */
+    struct event*  ev;              /* event that needs to be cleaned up after
+                                     * the timeout expires */
+    char*          side;
+    int            pktIdx;
+} time_delay_packet;
+
+typedef struct event_list {
+    struct event* ev;
+    struct event_list* next;
+} event_list;
 
 static char* serverSide = "server";
 static char* clientSide = "client";
+
+event_list evCleanupList = { NULL, NULL };
+
+#define CLIENT_APP_DATA_SIZE 36
+#define SERVER_APP_DATA_SIZE 44
 
 char bogusAlert[] =
 {
@@ -178,7 +220,6 @@ static int GetOpt(int argc, char** argv, const char* optstring)
     return c;
 }
 
-
 static char* GetRecordType(const char* msg)
 {
     if (msg[0] == 0x16) {
@@ -240,9 +281,9 @@ static void IncrementRecordSeq(char* msg)
         unsigned long seq = (int)( msg[7] << 24 | msg[8] << 16 |
                                    msg[9] << 8 | msg[10] );
 
-        printf(" old seq: %lu\n", seq);
+        LOG(" old seq: %lu\n", seq);
         seq++;
-        printf(" new seq: %lu\n", seq);
+        LOG(" new seq: %lu\n", seq);
 
         msg[7] = (char)(seq >> 24);
         msg[8] = (char)(seq >> 16);
@@ -251,27 +292,41 @@ static void IncrementRecordSeq(char* msg)
     }
 }
 
-static void logMsg(char* side, char* msg, int msgSz)
+static void logMsg(char* side, char* msg, int msgSz, int pktIdx)
 {
-    printf("%s: E: %d Seq: %2d handshake: %2d got %s read %d bytes\n", side, GetRecordEpoch(msg), GetRecordSeq(msg), msg[18], GetRecordType(msg), msgSz);
+    if (!isDtls13)
+        LOG("%s: E: %d Seq: %2d handshake: %2d got %s read %d bytes\n", side,
+                GetRecordEpoch(msg), GetRecordSeq(msg), msg[18],
+                GetRecordType(msg), msgSz);
+    else
+        LOG("%d: %s: read %d bytes\n", pktIdx, side, msgSz);
 }
 
 typedef struct pkt {
     char bin[MSG_SIZE];
     int binSz;
+    int pktIdx;
     struct pkt* next;
 } pkt;
 static pkt* pktStore = NULL;
 
-static void pushPkt(char* msg, int msgSz)
+static void pushPkt(char* msg, int msgSz, int peerIdx)
 {
     if (msg && msgSz > 0) {
         pkt* tmp;
         pkt* new = (pkt*)malloc(sizeof(pkt));
         if (new == NULL)
             return;
-        printf("Storing pkt with seq %d\n", GetRecordSeq(msg));
+        if (!isDtls13)
+            LOG("Storing pkt with seq %d\n", GetRecordSeq(msg));
+        else
+            LOG("Storing pkt %d\n", peerIdx);
         memset(new, 0, sizeof(pkt));
+        new->pktIdx = peerIdx;
+        if (msgSz > MSG_SIZE) {
+            LOG("Truncating saved packet");
+            msgSz = MSG_SIZE;
+        }
         memcpy(new->bin, msg, msgSz);
         new->binSz = msgSz;
         if (pktStore == NULL) {
@@ -291,7 +346,7 @@ static void pktStoreDrain(char* side, SOCKET_T peerFd) {
     pkt* prev = NULL;
     pktStore = NULL;
     while (tmp != NULL) {
-        logMsg(side, tmp->bin, tmp->binSz);
+        logMsg(side, tmp->bin, tmp->binSz, tmp->pktIdx);
         send(peerFd, tmp->bin, tmp->binSz, 0);
         prev = tmp;
         tmp = tmp->next;
@@ -305,8 +360,9 @@ static void pktStoreSend(char* side, SOCKET_T peerFd) {
         pkt* prev = NULL;
         int seq = *seqOrder - '0';
         while (tmp != NULL) {
-            if (GetRecordSeq(tmp->bin) == seq) {
-                logMsg(side, tmp->bin, tmp->binSz);
+            if ((isDtls13 && tmp->pktIdx == seq) ||
+               (!isDtls13 && GetRecordSeq(tmp->bin) == seq)) {
+                logMsg(side, tmp->bin, tmp->binSz, tmp->pktIdx);
                 send(peerFd, tmp->bin, tmp->binSz, 0);
                 seqOrder++;
                 if (prev != NULL)
@@ -326,63 +382,188 @@ static void pktStoreSend(char* side, SOCKET_T peerFd) {
     }
 }
 
+static void clearEventList(void)
+{
+    event_list* list;
+    event_list* next;
+    for (list = &evCleanupList; list != NULL; list = list->next) {
+        if (list->ev != NULL)
+            event_free(list->ev);
+    }
+    list = evCleanupList.next;
+    evCleanupList.ev = NULL;
+    evCleanupList.next = NULL;
+    for (; list != NULL; list = next) {
+        next = list->next;
+        free(list);
+    }
+}
+
+static void addEventToCleanupList(struct event* ev)
+{
+    if (evCleanupList.ev == NULL)
+        evCleanupList.ev = ev;
+    else {
+        event_list* list = &evCleanupList;
+        while (list->next != NULL)
+            list = list->next;
+        list->next = (event_list*)malloc(sizeof(event_list));
+        if (list->next == NULL) {
+            perror("malloc failed");
+            exit(EXIT_FAILURE);
+        }
+        list->next->ev = ev;
+        list->next->next = NULL;
+    }
+}
+
+static void sendTimeDelayedPkt(evutil_socket_t fd, short flags, void* arg)
+{
+    time_delay_packet* tctx = (time_delay_packet*)arg;
+
+    clearEventList();
+
+    if (tctx->side == serverSide)
+        SET_BLUE;
+    else
+        SET_YELLOW;
+    logMsg(tctx->side, tctx->msg, tctx->msgLen, tctx->pktIdx);
+    RESET_COLOR;
+    send(tctx->fd, tctx->msg, tctx->msgLen, 0);
+
+    /* Add event to cleanup queue */
+    addEventToCleanupList(tctx->ev);
+    free(tctx);
+}
+
 /* msg callback, send along to peer or do manipulation */
 static void Msg(evutil_socket_t fd, short which, void* arg)
 {
     static int msgCount = 0;
+    static int peerIdx[2] = {-1, -1}; /* Number of packets seen from peer.
+                                       * [0] client [1] server */
 
     char       msg[MSG_SIZE];
     proxy_ctx* ctx = (proxy_ctx*)arg;
     int        ret = recv(fd, msg, MSG_SIZE, 0);
+    int whiteList = 0;
+
+    clearEventList();
 
     if (ret == 0)
-        printf("read 0\n");
+        LOG("read 0\n");
     else if (ret < 0)
-        printf("read < 0\n");
+        LOG("read < 0\n");
     else {
         SOCKET_T peerFd;
         char* side;   /* from message side */
+        int sideIdx;
 
         if (ctx->serverFd == fd) {
             peerFd = ctx->clientFd;
             side   = serverSide;
+            sideIdx = 1;
         }
         else {
             peerFd = ctx->serverFd;
             side   = clientSide;
+            sideIdx = 0;
         }
 
-        if (side == selectedSide && GetRecordEpoch(msg) == 0 
-                && *seqOrder != '\0') {
-            int seq = *seqOrder - '0';
-            if (GetRecordSeq(msg) != seq) {
-                pushPkt(msg, ret);
-                return;
+        peerIdx[sideIdx]++;
+
+        if (!isDtls13) {
+            if (side == selectedSide && GetRecordEpoch(msg) == 0
+                    && *seqOrder != '\0') {
+                int seq = *seqOrder - '0';
+                if (GetRecordSeq(msg) != seq) {
+                    pushPkt(msg, ret, -1);
+                    return;
+                }
+                else {
+                    seqOrder++;
+                }
             }
-            else {
-                seqOrder++;
+        }
+        else {
+            /* No way of knowing what the sequence number is so just blindly
+             * re-order the encrypted packets */
+            if (side == selectedSide && *seqOrder != '\0') {
+                int seq = *seqOrder - '0';
+                if (peerIdx[sideIdx] != seq) {
+                    pushPkt(msg, ret, peerIdx[sideIdx]);
+                    return;
+                }
+                else {
+                    seqOrder++;
+                }
             }
+        }
+
+
+        if (*delayOrder != '\0') {
+            /* We need to delay this packet */
+            struct event* ev;
+            double t = strtod(delayOrder, (char**)&delayOrder);
+            time_delay_packet* tctx =
+                    (time_delay_packet*)malloc(sizeof(time_delay_packet));
+            struct timeval timeout = { 0 };
+
+            if (tctx == NULL) {
+                perror("malloc failed");
+                exit(EXIT_FAILURE);
+            }
+
+            if (*delayOrder == ',')
+                delayOrder++;
+
+            memcpy(tctx->msg, msg, ret);
+            tctx->msgLen = ret;
+            tctx->fd = peerFd;
+            tctx->side = side;
+            tctx->pktIdx = peerIdx[sideIdx];
+
+            LOG("*** delaying packet %d by %f seconds\n", peerIdx[sideIdx], t);
+            timeout.tv_usec = (int)(modf(t, &t) * 1000000.0);
+            timeout.tv_sec = (int)t;
+
+            ev = evtimer_new(base, sendTimeDelayedPkt, tctx);
+            if (ev == NULL) {
+                perror("evtimer_new failed");
+                exit(EXIT_FAILURE);
+            }
+            tctx->ev = ev;
+            if (evtimer_add(ev, &timeout) != 0) {
+                perror("evtimer_add failed");
+                exit(EXIT_FAILURE);
+            }
+            return;
         }
 
         if (side == serverSide)
             SET_BLUE;
         else
             SET_YELLOW;
-        logMsg(side, msg, ret);
+        logMsg(side, msg, ret, peerIdx[sideIdx]);
         RESET_COLOR;
 
         msgCount++;
+
+        if (whitelistAppData &&
+            ((side == serverSide && ret == SERVER_APP_DATA_SIZE) ||
+             (side == clientSide && ret == CLIENT_APP_DATA_SIZE)))
+            whiteList = 1;
 
         if (delayByOne &&
             GetRecordEpoch(msg) == 0 &&
             GetRecordSeq(msg) == delayByOne &&
             side == selectedSide) {
 
-            printf("*** delaying server packet %d\n", delayByOne);
+            LOG("*** delaying server packet %d\n", delayByOne);
             if (currDelay == NULL)
                currDelay = &tmpDelay;
             else {
-               printf("*** oops, still have a packet in delay\n");
+               LOG("*** oops, still have a packet in delay\n");
                assert(0);
             }
             memcpy(currDelay->msg, msg, ret);
@@ -395,7 +576,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
         /* is it now time to send along delayed packet */
         if (delayPacket && currDelay && currDelay->sendCount == msgCount) {
-            printf("*** sending on delayed packet\n");
+            LOG("*** sending on delayed packet\n");
             send(currDelay->peerFd, currDelay->msg, currDelay->msgLen, 0);
             currDelay = NULL;
         }
@@ -403,18 +584,29 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         /* should we specifically drop the current packet from epoch 0 */
         if (dropSpecific && side == selectedSide &&
             GetRecordEpoch(msg) == dropSpecificEpoch &&
-            GetRecordSeq(msg) == dropSpecificSeq) {
-            printf("*** but dropping this packet specifically\n");
+            GetRecordSeq(msg) == dropSpecificSeq && !whiteList) {
+            LOG("*** but dropping this packet specifically\n");
+            return;
+        }
+
+        if (dropNth && dropPacketNo == msgCount && !whiteList) {
+            LOG("*** but dropping the %d packet\n", msgCount);
+            return;
+        }
+
+        if (dropBySize && ret == dropSize && !whiteList) {
+            LOG("*** but dropping the %d packet of size %d\n", msgCount, ret);
+            dropBySize = 0;
             return;
         }
 
         /* should we delay the current packet */
         if (delayPacket && (msgCount % delayPacket) == 0) {
-            printf("*** but delaying this packet\n");
+            LOG("*** but delaying this packet\n");
             if (currDelay == NULL)
                currDelay = &tmpDelay;
             else {
-               printf("*** oops, still have a packet in delay\n");
+               LOG("*** oops, still have a packet in delay\n");
                assert(0);
             }
             memcpy(currDelay->msg, msg, ret);
@@ -427,20 +619,21 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
 
         /* should we drop current packet altogether */
         if (dropPacket && (msgCount % dropPacket) == 0 
-             && msg[0] != 0x17 /* But don't drop application data */) {
-            printf("*** but dropping this packet\n");
+             && msg[0] != 0x17 /* But don't drop application data */
+            && !whiteList) {
+            LOG("*** but dropping this packet\n");
             return;
         }
 
         /* forward along */
         send(peerFd, msg, ret, 0);
-        
+
         if (side == selectedSide) {
             if (side == serverSide)
                 SET_BLUE;
             else
                 SET_YELLOW;
-            if (GetRecordEpoch(msg) == 0 && *seqOrder != '\0')
+            if ((isDtls13 || GetRecordEpoch(msg) == 0) && *seqOrder != '\0')
                 pktStoreSend(side, peerFd);
             else
                 pktStoreDrain(side, peerFd);
@@ -453,7 +646,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
                 injectAlert = 2;
             }
             if (injectAlert == 2 && side == serverSide && msg[0] == 0x14) {
-                printf("*** injecting a bogus alert from client after "
+                LOG("*** injecting a bogus alert from client after "
                        "change cipher spec\n");
                 ret = send(ctx->serverFd, bogusAlert, sizeof(bogusAlert), 0);
                 if (ret < 0) {
@@ -482,7 +675,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
             side == selectedSide &&
             currDelay) {
 
-            printf("*** sending on delayed packet\n");
+            LOG("*** sending on delayed packet\n");
             send(currDelay->peerFd, currDelay->msg, currDelay->msgLen, 0);
             currDelay = NULL;
         }
@@ -511,7 +704,7 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
        'connection' again, also allows pairing with upStream 'connect' */
     msgLen = recvfrom(fd, msg, MSG_SIZE, 0, (struct sockaddr*)&client, &len);
     SET_YELLOW;
-    printf("%s: got %s, first msg\n", clientSide, GetRecordType(msg));
+    LOG("%s: got %s, first msg\n", clientSide, GetRecordType(msg));
     RESET_COLOR;
     ctx->clientFd = socket(AF_INET, SOCK_DGRAM, 0);
     if (ctx->clientFd == INVALID_SOCKET) {
@@ -566,6 +759,11 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
     }
     event_add(srvEvent, NULL);
 
+    if (dropNth && dropPacketNo == 0) {
+        LOG("*** but dropping this packet\n");
+        return;
+    }
+
     /* send along initial client message */
     ret = send(ctx->serverFd, msg, msgLen, 0);
     if (ret < 0) {
@@ -583,6 +781,7 @@ static void Usage(void)
     printf("-p <num>            Proxy port to 'listen' on\n");
     printf("-s <server:port>    Server address in dotted decimal:port\n");
     printf("-d <num>            Drop every <num> packet, default 0\n");
+    printf("-f <num>            Drop the <num> packet, default none\n");
     printf("-x <epoch>:<num>    "
            "Drop specifically packet with sequence <num> from <epoch>\n");
     printf("-y <num>            Delay every <num> packet, default 0\n");
@@ -594,6 +793,12 @@ static void Usage(void)
     printf("-r <pkt seq>        Re-order packets from zeroth epoch in this order\n"
            "                    ex: 146523\n");
     printf("-S <client|server>  Force side (default: server)\n");
+    printf("-u                  Interpret traffic as DTLS 1.3\n");
+    printf("-l <log file>       Use the provided argument as the log file\n");
+    printf("-t <delays>         Comma seperated list of delays for each \n"
+           "                    subsequent packet in seconds.\n");
+    printf("-F <size>           Drop first packet of <size> bytes\n");
+    printf("-w                  Don't drop packet with same size of application data packet of wolfSSL examples\n");
 }
 
 
@@ -605,7 +810,9 @@ int main(int argc, char** argv)
     short port = -1;
     char* serverString = NULL;
 
-    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:r:")) != -1) {
+    setlocale(LC_ALL, ""); /* Make portable */
+
+    while ( (ch = GetOpt(argc, argv, "?Dap:s:d:y:x:b:R:S:r:f:ul:t:F:w")) != -1) {
         switch (ch) {
             case '?' :
                 Usage();
@@ -658,6 +865,25 @@ int main(int argc, char** argv)
                 }
                 break;
 
+            case 't' :
+                {
+                    const char* c = delayOrder = myoptarg;
+                    while (*c != '\0') {
+                        double d = strtod(c, (char**)&c);
+                        if (d == 0.0) {
+                            Usage();
+                            exit(MY_EX_USAGE);
+                        }
+                        if (*c == ',')
+                            c++;
+                    }
+                    if (*c != '\0') {
+                        Usage();
+                        exit(MY_EX_USAGE);
+                    }
+                }
+                break;
+
             case 'a':
                 injectAlert = 1;
                 break;
@@ -673,6 +899,28 @@ int main(int argc, char** argv)
                 }
                 break;
 
+            case 'f':
+                dropNth = 1;
+                dropPacketNo = atoi(myoptarg);
+                break;
+
+            case 'F':
+                dropBySize = 1;
+                dropSize = atoi(myoptarg);
+                break;
+
+            case 'u':
+                isDtls13 = 1;
+                break;
+
+            case 'l':
+                logFile = myoptarg;
+                break;
+
+            case 'w':
+                whitelistAppData = 1;
+                break;
+
             default:
                 Usage();
                 exit(MY_EX_USAGE);
@@ -680,14 +928,22 @@ int main(int argc, char** argv)
         }
     }
 
+    if (logFile != NULL) {
+        fp  = fopen(logFile, "w");
+        if (fp == NULL) {
+            LOG("Can't open log file\n");
+            exit(MY_EX_IOERR);
+        }
+    }
+
     if (port == -1) {
-        printf("need to set 'listen port'\n");
+        LOG("need to set 'listen port'\n");
         Usage();
         exit(MY_EX_USAGE);
     }
 
     if (serverString == NULL) {
-        printf("need to set server address string\n");
+        LOG("need to set server address string\n");
         Usage();
         exit(MY_EX_USAGE);
     }
@@ -743,7 +999,7 @@ int main(int argc, char** argv)
 
     event_base_dispatch(base);
 
-    printf("done with dispatching\n");
+    LOG("done with dispatching\n");
 
     return 0;
 }
