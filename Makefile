@@ -4,10 +4,7 @@ LIBS=-levent
 
 all:udp_proxy tcp_proxy
 
-udp_proxy:udp_proxy.o
-	$(CC) -o $@ $^ $(CFLAGS) $(CPPFLAGS) $(LIBS)
-
-tcp_proxy:tcp_proxy.o
+%: %.c
 	$(CC) -o $@ $^ $(CFLAGS) $(CPPFLAGS) $(LIBS)
 
 .PHONY: clean all
