@@ -459,6 +459,7 @@ static void Msg(evutil_socket_t fd, short which, void* arg)
         char* side;   /* from message side */
         int sideIdx;
 
+        /* newClient relies on us only checking the server side equality */
         if (ctx->serverFd == fd) {
             peerFd = ctx->clientFd;
             side   = serverSide;
@@ -689,8 +690,7 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
     int ret, on = 1;
     struct sockaddr_in client;
     SOCKLEN_T len = sizeof(client);
-    char msg[MSG_SIZE];
-    int  msgLen;
+    char msg[1];
     struct event* cliEvent;
     struct event* srvEvent;
 
@@ -702,10 +702,12 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
 
     /* let's 'connect' to client so main loop doesn't hear about this
        'connection' again, also allows pairing with upStream 'connect' */
-    msgLen = recvfrom(fd, msg, MSG_SIZE, 0, (struct sockaddr*)&client, &len);
-    SET_YELLOW;
-    LOG("%s: got %s, first msg\n", clientSide, GetRecordType(msg));
-    RESET_COLOR;
+    ret = recvfrom(fd, msg, sizeof(msg), MSG_PEEK, (struct sockaddr*)&client,
+            &len);
+    if (ret < 1) {
+        perror("recvfrom failed");
+        exit(EXIT_FAILURE);
+    }
     ctx->clientFd = socket(AF_INET, SOCK_DGRAM, 0);
     if (ctx->clientFd == INVALID_SOCKET) {
         perror("socket failed");
@@ -744,6 +746,9 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
         exit(EXIT_FAILURE);
     }
 
+    /* Process the first msg */
+    Msg(fd, 0, ctx);
+
     /* client and server both use same Msg relay callback */
     cliEvent = event_new(base, ctx->clientFd, EV_READ|EV_PERSIST, Msg, ctx); 
     if (cliEvent == NULL) {
@@ -758,18 +763,6 @@ static void newClient(evutil_socket_t fd, short which, void* arg)
         exit(EXIT_FAILURE);
     }
     event_add(srvEvent, NULL);
-
-    if (dropNth && dropPacketNo == 0) {
-        LOG("*** but dropping this packet\n");
-        return;
-    }
-
-    /* send along initial client message */
-    ret = send(ctx->serverFd, msg, msgLen, 0);
-    if (ret < 0) {
-        perror("send failed");
-        exit(EXIT_FAILURE);
-    }
 }
 
 
